@@ -1,20 +1,8 @@
-# Parallax - Immutable Torch Modules for JAX
+import jax
+import jax.nn.initializers as init
 
+from .core import *
 
-<img width=450px src="https://developers.google.com/web/updates/images/2016/12/performant-parallaxing/parallax.jpg">
-
-
-Parallax is a prototype for a pure module system for JAX implemented by Sabrina Mielke (@sjmielke) and Sasha Rush (@srush).
-
-Main ideas:
-
-* Make param modules immutable trees.
-* Replace all imperative style coding and init.
-* Avoid tracking state for most applications by first distributing seeds / globals through tree.
-
-```python
-
-from parallax import Module, Parameter, ParamInit
 
 class Dense(Module):
     # All parameter-holders are explicitly declared.
@@ -27,7 +15,6 @@ class Dense(Module):
         self.weight = ParamInit((out_size, in_size), init.xavier_normal())
         self.bias = ParamInit((out_size,), init.normal())
 
-
     # Forward is just like standard pytorch.
     def forward(self, input):
         return self.weight @ input + self.bias
@@ -35,6 +22,7 @@ class Dense(Module):
     # Hook for pretty printing
     def extra_repr(self):
         return "%d, %d"%(self.weight.shape[1], self.weight.shape[0])
+
 
 class Dropout(Module):
     # Arbitrary constants allowed.
@@ -53,7 +41,9 @@ class Dropout(Module):
         else:
             return input
 
+
 class BinaryNetwork(Module):
+
     # No difference between modules and parameters
     dense1 : Dense
     dense2 : Dense
@@ -81,31 +71,53 @@ class BinaryNetwork(Module):
 
         return jax.nn.sigmoid(self.dense3(jax.numpy.tanh(x)))[0]
 
-# Setup param tree -> declarative, immutable
-layer = BinaryNetwork(5, 10)
-print(layer)
-print(layer.dense1)
 
-# Initialize parameters -> stateful, hidden
-rng = jax.random.PRNGKey(0)
-layer = layer.initialized(rng)
-print(layer)
-print(layer.dense1)
+class LSTMCell(Module):
+    weight_ih : Parameter
+    linear_hh : Dense
 
-initial_loss = None
-for i in range(10):
-    # Thread state through parameters -> functor, hidden
-    rng, iter_rng = jax.random.split(rng)
-    layer = layer.new_state(iter_rng, mode="train")
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.weight_ih = ParamInit((input_size, 4 * hidden_size), init.normal())
+        self.linear_hh = Dense(input_size, 4 * hidden_size)
+
+    def forward(self, input, h, c):
+        ifgo = self.weight_ih.T @ input + self.linear_hh(h)
+        i, f, g, o = jax.numpy.split(ifgo, indices_or_sections=4, axis=-1)
+        i = jax.nn.sigmoid(i)
+        f = jax.nn.sigmoid(f)
+        g = jax.numpy.tanh(g)
+        o = jax.nn.sigmoid(o)
+        new_c = f * c + i * g
+        new_h = o * jax.numpy.tanh(new_c)
+        return (new_h, new_c)
+
+
+class MultiLayerLSTM(Module):
+    # Dynamic number of parameters and modules
+    cells : ModuleTuple
+    c_0s : ParameterTuple
+
+    def __init__(self, n_layers, n_hidden):
+        """For simplicity, have everything have the same dimension."""
+        super().__init__()
+        self.cells = ModuleTuple([
+            LSTMCell(n_hidden, n_hidden)
+            for _ in range(n_layers)
+        ])
+        self.c_0s = ParameterTuple([
+            ParamInit((n_hidden,), init.normal())
+            for _ in range(n_layers)
+        ])
     
-    # Jax style grad compute -> tree-shaped immutable
-    x = jax.numpy.zeros(5)
-    loss = layer(x)
-    if initial_loss is None:
-        initial_loss = loss
-    print(loss)
-    grad = layer.grad(x)
-    
-    # Grad Update -> tree-shaped
-    layer = jax.tree_util.tree_multimap(lambda p, g: p - 0.3 * g, layer, grad)
-```
+    @property
+    def hc_0s(self):
+        return tuple((jax.numpy.tanh(c_0), c_0) for c_0 in self.c_0s)
+
+    @jax.jit  # a lot faster (try it without!)
+    def forward(self, input, hcs):
+        new_hcs = []
+        for cell, hc in zip(self.cells, hcs):
+            input, c = cell(input, *hc)
+            new_hcs.append((input, c))
+        return tuple(new_hcs)
